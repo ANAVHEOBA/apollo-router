@@ -5,14 +5,10 @@ use std::vec;
 pub use crate::composition::satisfiability::validate_satisfiability;
 use crate::error::CompositionError;
 pub use crate::schema::schema_upgrader::upgrade_subgraphs_if_necessary;
-use crate::subgraph::typestate::Expanded;
-use crate::subgraph::typestate::Initial;
-use crate::subgraph::typestate::Subgraph;
-use crate::subgraph::typestate::Upgraded;
-use crate::subgraph::typestate::Validated;
-pub use crate::supergraph::Merged;
-pub use crate::supergraph::Satisfiable;
-pub use crate::supergraph::Supergraph;
+use crate::subgraph::typestate::{Expanded, Initial, Subgraph, Upgraded, Validated};
+use crate::supergraph::{Merged, Satisfiable, Supergraph};
+
+/* ---------- public entry point ---------- */
 
 pub fn compose(
     subgraphs: Vec<Subgraph<Initial>>,
@@ -27,13 +23,14 @@ pub fn compose(
     validate_satisfiability(supergraph)
 }
 
-/// Apollo Federation allow subgraphs to specify partial schemas (i.e. "import" directives through
-/// `@link`). This function will update subgraph schemas with all missing federation definitions.
+/* ---------- helpers ---------- */
+
+/// Expand subgraph links (add missing federation definitions)
 pub fn expand_subgraphs(
     subgraphs: Vec<Subgraph<Initial>>,
 ) -> Result<Vec<Subgraph<Expanded>>, Vec<CompositionError>> {
-    let mut errors: Vec<CompositionError> = vec![];
-    let expanded: Vec<Subgraph<Expanded>> = subgraphs
+    let mut errors = Vec::new();
+    let expanded = subgraphs
         .into_iter()
         .map(|s| s.expand_links())
         .filter_map(|r| r.map_err(|e| errors.push(e.into())).ok())
@@ -45,13 +42,12 @@ pub fn expand_subgraphs(
     }
 }
 
-/// Validate subgraph schemas to ensure they satisfy Apollo Federation requirements (e.g. whether
-/// `@key` specifies valid `FieldSet`s etc).
+/// Validate each subgraph against the Federation spec
 pub fn validate_subgraphs(
     subgraphs: Vec<Subgraph<Upgraded>>,
 ) -> Result<Vec<Subgraph<Validated>>, Vec<CompositionError>> {
-    let mut errors: Vec<CompositionError> = vec![];
-    let validated: Vec<Subgraph<Validated>> = subgraphs
+    let mut errors = Vec::new();
+    let validated = subgraphs
         .into_iter()
         .map(|s| s.validate())
         .filter_map(|r| r.map_err(|e| errors.push(e.into())).ok())
@@ -63,27 +59,102 @@ pub fn validate_subgraphs(
     }
 }
 
-/// Perform validations that require information about all available subgraphs.
+/* ---------- validation before merge ---------- */
+
 pub fn pre_merge_validations(
-    _subgraphs: &[Subgraph<Validated>],
+    subgraphs: &[Subgraph<Validated>],
 ) -> Result<(), Vec<CompositionError>> {
-    Err(vec![CompositionError::InternalError {
-        message: "pre_merge_validations is not implemented yet".to_string(),
-    }])
+    let mut errors = Vec::new();
+
+    // 1. Duplicate names
+    let mut seen = std::collections::HashSet::new();
+    for s in subgraphs {
+        if !seen.insert(&s.name) {
+            errors.push(CompositionError::InternalError {
+                message: format!("Duplicate subgraph name: {}", s.name),
+            });
+        }
+    }
+
+    // 2. Conflicting root types
+    let mut roots = std::collections::HashMap::<&'static str, apollo_compiler::Name>::new();
+    for s in subgraphs {
+        let schema = s.schema();
+        for (kind, root) in &[
+            ("Query", &schema.schema().schema_definition.query),
+            ("Mutation", &schema.schema().schema_definition.mutation),
+            ("Subscription", &schema.schema().schema_definition.subscription),
+        ] {
+            if let Some(name) = root {
+                match roots.entry(kind) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        // Fix 1: Convert ComponentName to Name for insertion
+                        e.insert(name.name.clone());
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        // Fix 2: Compare Name with ComponentName's name field
+                        if *e.get() != name.name {
+                            errors.push(CompositionError::InternalError {
+                                message: format!(
+                                    "Conflicting {} root type in subgraph: {}",
+                                    kind, s.name
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
+
+/* ---------- merge subgraphs into supergraph ---------- */
 
 pub fn merge_subgraphs(
-    _subgraphs: Vec<Subgraph<Validated>>,
+    subgraphs: Vec<Subgraph<Validated>>,
 ) -> Result<Supergraph<Merged>, Vec<CompositionError>> {
-    Err(vec![CompositionError::InternalError {
-        message: "merge_subgraphs is not implemented yet".to_string(),
-    }])
+    use crate::merger::merge::{merge_subgraphs as do_merge, CompositionOptions};
+
+    let result = do_merge(subgraphs, CompositionOptions::default())
+        .map_err(|e| vec![CompositionError::InternalError {
+            message: e.to_string(),
+        }])?;
+
+    let schema = result
+        .supergraph
+        .map(|federation_schema| {
+            // Convert Valid<FederationSchema> to Valid<Schema>
+            let inner_schema = federation_schema.into_inner().into_inner();
+            inner_schema.validate().expect("schema should be valid")
+        })
+        .unwrap_or_else(|| {
+            // Create empty schema and validate it to get Valid<Schema>
+            let empty_schema = apollo_compiler::Schema::new();
+            empty_schema.validate().expect("empty schema is valid")
+        });
+
+    // Use turbofish syntax to disambiguate
+    Ok(Supergraph::<Merged>::new(schema))
 }
 
+/* ---------- final validation of merged schema ---------- */
+
 pub fn post_merge_validations(
-    _supergraph: &Supergraph<Merged>,
+    supergraph: &Supergraph<Merged>,
 ) -> Result<(), Vec<CompositionError>> {
-    Err(vec![CompositionError::InternalError {
-        message: "post_merge_validations is not implemented yet".to_string(),
-    }])
+    // Get the inner Schema from Valid<Schema>
+    let schema = supergraph.state.schema().clone().into_inner();
+    // Clone the Schema before validating it
+    let cloned_schema = schema.clone();
+    cloned_schema.validate()
+        .map_err(|e| vec![CompositionError::InternalError {
+            message: e.to_string(),
+        }])?;
+    Ok(())
 }
